@@ -1,202 +1,148 @@
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
-const express = require('express');
-const qrcode = require('qrcode-terminal');
+const { createClient } = require('@libsql/client');
 const pino = require('pino');
+const qrcode = require('qrcode-terminal');
 const fs = require('fs');
-const path = require('path');
 
-const app = express();
-app.use(express.json());
+const db = createClient({
+    url: 'libsql://mds-sports-charuka55.aws-ap-northeast-1.turso.io',
+    authToken: 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODIzMDkxOTksImlkIjoiMDE5ZWY5ZTQtYWUwMS03ZTA1LWE5ZjctNTBjMTMwZWVmNjdlIiwicmlkIjoiYmRmMzFmMmEtY2U5NC00NjIyLTllNTItNTM1NDI5MWE2ZjIwIn0.P6eCYz0YwJzXJcFwu3TqgfDpubNuG3jO2gtyrDqcPorPuCAvvcyxIRnfZ0SjSwFJygKEiMr-iUwyTXlgV5GvCw'
+});
 
 let botSocket = null;
-const PORT = process.env.PORT || 3000;
+let isConnected = false;
+let myNumber = null;
+const logger = pino({ level: 'info' });
 
-const logger = pino({ 
-    level: 'info',
-    transport: {
-        target: 'pino-pretty',
-        options: {
-            colorize: true,
-            ignore: 'pid,hostname'
+// Debug log function
+function debugLog(message) {
+    const timestamp = new Date().toISOString();
+    const log = '[' + timestamp + '] ' + message + '\n';
+    console.log(message);
+    try {
+        fs.appendFileSync('debug-send.log', log);
+    } catch(e) {}
+}
+
+async function getPendingOTPs() {
+    try {
+        const result = await db.execute(
+            "SELECT * FROM schools WHERE is_verified = 0 AND otp_code IS NOT NULL AND otp_expires_at > datetime('now') AND status = 'pending' AND otp_sent_at IS NULL LIMIT 5"
+        );
+        return result.rows;
+    } catch(err) { return []; }
+}
+
+async function markAsSent(id) {
+    try { await db.execute({ sql: "UPDATE schools SET otp_sent_at = datetime('now') WHERE id = ?", args: [id] }); } catch(err) {}
+}
+
+async function sendOTP(sock, school_name, whatsapp_number, otp_code) {
+    debugLog('═══════════════════════════════');
+    debugLog('📤 SEND ATTEMPT');
+    debugLog('📱 Bot: ' + (sock?.user?.id?.split(':')[0] || 'unknown'));
+    debugLog('📱 To: ' + whatsapp_number);
+    debugLog('🏫 School: ' + school_name);
+    debugLog('🔑 OTP: ' + otp_code);
+    
+    if (!sock || !sock.user) {
+        debugLog('❌ FAIL: No socket');
+        debugLog('═══════════════════════════════');
+        return false;
+    }
+    
+    const message = '🏆 *MDS 2025*\n\n🏫 *' + school_name + '*\n🔑 OTP: *' + otp_code + '*\n⏰ 10 mins';
+    
+    const formats = [
+        whatsapp_number + '@s.whatsapp.net',
+        whatsapp_number.replace(/^94/, '') + '@s.whatsapp.net'
+    ];
+    
+    for (let i = 0; i < formats.length; i++) {
+        const jid = formats[i];
+        debugLog('📤 Try ' + (i+1) + ': ' + jid);
+        
+        try {
+            const result = await sock.sendMessage(jid, { text: message });
+            debugLog('✅ RESULT: ' + JSON.stringify(result));
+            debugLog('✅ SENT! ID: ' + (result?.key?.id || 'NONE'));
+            debugLog('═══════════════════════════════');
+            return true;
+        } catch (err) {
+            debugLog('❌ Error: ' + err.message);
         }
     }
-});
-
-// Serve QR code image
-app.get('/qr', (req, res) => {
-    const qrPath = path.join(__dirname, 'qr-code.txt');
-    if (fs.existsSync(qrPath)) {
-        res.send('<pre>' + fs.readFileSync(qrPath, 'utf8') + '</pre>');
-    } else {
-        res.send('QR not yet generated. Bot may already be connected.');
-    }
-});
-
-// Webhook endpoint
-app.post('/webhook/send-otp', async (req, res) => {
-    const { school_name, whatsapp_number, otp_code } = req.body;
     
-    console.log('========================================');
-    console.log('📨 NEW OTP REQUEST');
-    console.log('School:', school_name);
-    console.log('WhatsApp:', whatsapp_number);
-    console.log('OTP:', otp_code);
-    console.log('========================================');
+    debugLog('❌ ALL FAILED');
+    debugLog('═══════════════════════════════');
+    return false;
+}
+
+async function checkAndSend() {
+    if (!isConnected || !botSocket || !botSocket.user) return;
     
-    if (!botSocket) {
-        console.log('❌ Bot not connected to WhatsApp');
-        return res.json({ success: false, message: 'Bot not ready. Please try again.' });
+    const pending = await getPendingOTPs();
+    
+    if (pending.length === 0) {
+        debugLog('✅ No pending');
+        return;
     }
     
-    try {
-        const jid = whatsapp_number + '@s.whatsapp.net';
-        
-        const message = 
-            '🏆 *Mahawilachchiya Divisional Sports 2025*\n\n' +
-            '📋 *School Registration - OTP Verification*\n\n' +
-            '┌──────────────────────┐\n' +
-            '│  🏫 School: *' + school_name + '*\n' +
-            '│  🔑 OTP Code: *' + otp_code + '*\n' +
-            '│  ⏰ Expires in: 10 minutes\n' +
-            '└──────────────────────┘\n\n' +
-            '📌 *Instructions:*\n' +
-            '1️⃣ Go to the registration page\n' +
-            '2️⃣ Enter this 6-digit OTP\n' +
-            '3️⃣ Complete your verification\n\n' +
-            '🔒 Do NOT share this OTP!\n' +
-            '📞 Need help? Contact admin.\n\n' +
-            '_Mahawilachchiya Divisional Sports 2025_ 🇱🇰';
-        
-        await botSocket.sendMessage(jid, { text: message });
-        
-        console.log('✅ OTP SENT SUCCESSFULLY!');
-        console.log('================================\n');
-        
-        res.json({ 
-            success: true, 
-            message: 'OTP sent successfully to ' + whatsapp_number 
-        });
-        
-    } catch (err) {
-        console.error('❌ Send error:', err.message);
-        res.json({ success: false, message: 'Failed to send: ' + err.message });
-    }
-});
-
-// Health check
-app.get('/', (req, res) => {
-    res.json({ 
-        status: 'online',
-        bot: 'Mahawilachchiya Sports OTP Bot',
-        whatsapp: botSocket ? 'connected' : 'disconnected',
-        uptime: Math.floor(process.uptime()) + ' seconds',
-        timestamp: new Date().toISOString()
-    });
-});
-
-// Status page
-app.get('/status', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>MDS OTP Bot Status</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-                body { font-family: Arial; text-align: center; padding: 40px; background: #1a1a1a; color: white; }
-                .card { background: #2a2a2a; padding: 30px; border-radius: 12px; max-width: 400px; margin: 0 auto; }
-                .online { color: #2ecc71; font-size: 48px; }
-                h1 { font-size: 24px; }
-                .info { color: #c4a47a; }
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <div class="online">✅</div>
-                <h1>MDS OTP Bot</h1>
-                <p>Status: <span class="info">Online</span></p>
-                <p>WhatsApp: <span class="info">${botSocket ? 'Connected' : 'Connecting...'}</span></p>
-                <p>Uptime: <span class="info">${Math.floor(process.uptime())}s</span></p>
-                <p>Webhook: <span class="info">/webhook/send-otp</span></p>
-            </div>
-        </body>
-        </html>
-    `);
-});
-
-// WhatsApp Bot
-async function startBot() {
-    console.log('\n🤖 Starting WhatsApp Bot...\n');
+    debugLog('📨 Found ' + pending.length + ' pending');
     
-    try {
-        const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-        const { version } = await fetchLatestBaileysVersion();
-        
-        console.log('📱 WhatsApp Version:', version.join('.'));
-        
-        const sock = makeWASocket({
-            version,
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, logger)
-            },
-            printQRInTerminal: true,
-            browser: Browsers.ubuntu('Chrome'),
-            logger,
-            markOnlineOnConnect: true,
-            syncFullHistory: false,
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000
-        });
-        
-        botSocket = sock;
-        
-        sock.ev.on('connection.update', (update) => {
-            const { connection, lastDisconnect, qr } = update;
-            
-            if (qr) {
-                console.log('\n📱 ===== SCAN THIS QR CODE =====\n');
-                qrcode.generate(qr, { small: true });
-                
-                // Save QR to file
-                fs.writeFileSync('qr-code.txt', qr);
-                console.log('QR also saved to qr-code.txt\n');
-            }
-            
-            if (connection === 'close') {
-                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
-                console.log('Connection closed. Reconnecting:', shouldReconnect);
-                if (shouldReconnect) {
-                    setTimeout(startBot, 5000);
-                }
-            }
-            
-            if (connection === 'open') {
-                console.log('\n✅ WhatsApp Connected Successfully!');
-                console.log('📱 Bot is ready to send OTPs');
-                console.log('📡 Webhook endpoint: /webhook/send-otp\n');
-            }
-        });
-        
-        sock.ev.on('creds.update', saveCreds);
-        
-    } catch (err) {
-        console.error('❌ Bot error:', err.message);
-        setTimeout(startBot, 10000);
+    for (const req of pending) {
+        await markAsSent(req.id);
+        const sent = await sendOTP(botSocket, req.school_name, req.whatsapp_number, req.otp_code);
+        if (!sent) {
+            await db.execute({ sql: "UPDATE schools SET otp_sent_at = NULL WHERE id = ?", args: [req.id] });
+        }
+        await new Promise(r => setTimeout(r, 2000));
     }
 }
 
-// Start everything
-console.log('🚀 Mahawilachchiya Divisional Sports OTP Bot');
-console.log('═'.repeat(50));
+async function startBot() {
+    debugLog('🤖 Bot Starting...');
+    
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    const { version } = await fetchLatestBaileysVersion();
+    
+    const sock = makeWASocket({
+        version,
+        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+        printQRInTerminal: true,
+        browser: Browsers.ubuntu('Chrome'),
+        logger: pino({ level: 'silent' }),
+        markOnlineOnConnect: false,
+        syncFullHistory: false
+    });
+    
+    botSocket = sock;
+    
+    sock.ev.on('connection.update', (update) => {
+        const { connection, qr } = update;
+        
+        if (qr) {
+            console.log('\n📱 SCAN QR CODE:');
+            qrcode.generate(qr, { small: true });
+            console.log('WhatsApp > Settings > Linked Devices > Scan\n');
+        }
+        
+        if (connection === 'open') {
+            isConnected = true;
+            myNumber = sock.user?.id?.split(':')[0] || 'unknown';
+            debugLog('✅ Connected! Number: ' + myNumber);
+            checkAndSend();
+            setInterval(checkAndSend, 10000);
+        }
+        
+        if (connection === 'close') {
+            isConnected = false;
+            debugLog('❌ Disconnected');
+        }
+    });
+    
+    sock.ev.on('creds.update', saveCreds);
+}
 
+console.log('🚀 MDS OTP Bot v5.0\n');
 startBot();
-
-app.listen(PORT, () => {
-    console.log('\n🌐 Server running on port ' + PORT);
-    console.log('📡 Health check: http://localhost:' + PORT + '/');
-    console.log('📡 Status page: http://localhost:' + PORT + '/status');
-    console.log('📡 QR Code: http://localhost:' + PORT + '/qr');
-    console.log('📡 Webhook: http://localhost:' + PORT + '/webhook/send-otp');
-    console.log('═'.repeat(50) + '\n');
-});
